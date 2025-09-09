@@ -259,11 +259,21 @@ async def smart_natural_language_query(query: str,
                 except Exception as e:
                     print(f"Error searching columns for '{kw}': {e}", file=sys.stderr)
 
-            # Build schema context from discovered tables (limit 5)
-            for table in list(discovered_tables)[:5]:
+           
+            # Rank discovered tables: prioritize ones with multiple keyword matches
+            ranked_tables = []
+            for table in discovered_tables:
+                score = sum(kw in table.lower() for kw in keywords)
+                ranked_tables.append((score, table))
+            ranked_tables.sort(reverse=True)
+
+            # Take top 2 most relevant tables only
+            top_tables = [t for _, t in ranked_tables[:2]]
+
+            schema_context = "The following tables are available. You MUST use only these:\n"
+            for table in top_tables:
                 try:
                     table_details = await get_table_details(table, include_lineage=False)
-                    table_details_map[table] = table_details
                     schema_context += f"\n{table_details}\n---\n"
                 except Exception as e:
                     print(f"Error getting details for table '{table}': {e}", file=sys.stderr)

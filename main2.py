@@ -17,10 +17,12 @@ import sys
 import logging
 import re
 import json
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +33,23 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 mcp = FastMCP("databricks")
+
+def extract_keywords(query: str) -> list:
+    """
+    Extract simple keywords from a natural language query.
+    Removes stopwords and punctuation.
+    Example: 
+      "Give me the customer email of customer with order ID 105"
+      -> ["customer", "email", "order", "id", "105"]
+    """
+    stopwords = {"the", "a", "an", "of", "with", "all", "get", "give", "show", "list", "for", "me", "whose"}
+    
+    # Lowercase + split words
+    tokens = re.findall(r"[A-Za-z0-9_]+", query.lower())
+    
+    # Filter out stopwords
+    keywords = [t for t in tokens if t not in stopwords]
+    return keywords
 
 def generate_sql_from_natural_language(
     query: str,
@@ -196,109 +215,69 @@ async def search_tables_by_description(description_pattern: str, catalog_name: O
 # ----------------
 
 @mcp.tool()
-async def smart_natural_language_query(query: str,
-                                       catalog_name: Optional[str] = None,
-                                       schema_name: Optional[str] = None,
-                                       auto_discover_schema: bool = True) -> str:
+async def smart_natural_language_query(query: str, catalog_name: Optional[str] = None, schema_name: Optional[str] = None) -> str:
+    """
+    Dynamically discovers the correct tables/columns and generates SQL
+    from natural language. Always enforces fully-qualified table names.
+    """
+
     try:
-        schema_context = ""
-        
-        if auto_discover_schema:
-            query_lower = query.lower()
-            stop_words = {'give','me','all','the','a','an','and','or','but','in','on',
-                          'at','to','for','of','with','by','is','are','was','were','whose',
-                          'what','which','when','where','why','how','many','much','few',
-                          'show','display','list','find','search','get','return'}
-            words = query_lower.split()
-            keywords = [w for w in words if w not in stop_words and len(w) > 2]
-            numbers = re.findall(r'\b\d+\b', query)
-            keywords.extend(numbers)
+        # 1. Extract keywords
+        keywords = extract_keywords(query)
+        print(f"Keywords extracted: {keywords}", file=sys.stderr)
 
-            column_variations = {
-                'name': ['name','names','firstname','lastname','fullname'],
-                'id': ['id','identifier','code','number'],
-                'customer': ['customer','client','user','account'],
-                'order': ['order','purchase','transaction'],
-                'product': ['product','item','sku','goods']
-            }
-            expanded_keywords = []
-            for kw in keywords:
-                expanded_keywords.append(kw)
-                for base, variations in column_variations.items():
-                    if kw in variations:
-                        expanded_keywords.extend(variations)
-                        break
-            keywords = list(set(expanded_keywords))
-            print(f"Extracted keywords: {keywords}", file=sys.stderr)
+        # 2. Search for matching tables in Hive Metastore & Unity Catalog
+        discovered_tables = set()
+        for kw in keywords:
+            # Search in Hive Metastore
+            tables_hive = await search_tables_by_name(kw, catalog_name="hive_metastore")
+            if tables_hive:
+                discovered_tables.update(tables_hive)
 
-            discovered_tables = set()
-            table_details_map = {}
+            # Search in Unity Catalog (if provided)
+            if catalog_name:
+                tables_uc = await search_tables_by_name(kw, catalog_name=catalog_name)
+                if tables_uc:
+                    discovered_tables.update(tables_uc)
 
-            for kw in keywords[:5]:
-                # Search name
-                search_result = await search_tables_by_name(kw)
-                if "Error" not in search_result and search_result.strip():
-                    for line in search_result.splitlines()[2:]:
-                        if '|' in line and not line.startswith('-'):
-                            parts = [p.strip() for p in line.split('|')]
-                            if len(parts) >= 3:
-                                full_table = f"{parts[0]}.{parts[1]}.{parts[2]}"
-                                discovered_tables.add(full_table)
+        if not discovered_tables:
+            return f"No tables found matching keywords: {keywords}"
 
-                # Search description
-                desc_result = await search_tables_by_description(kw)
-                if "Error" not in desc_result and desc_result.strip():
-                    for line in desc_result.splitlines()[2:]:
-                        if '|' in line and not line.startswith('-'):
-                            parts = [p.strip() for p in line.split('|')]
-                            if len(parts) >= 3:
-                                full_table = f"{parts[0]}.{parts[1]}.{parts[2]}"
-                                discovered_tables.add(full_table)
+        # 3. Rank tables by keyword overlap
+        ranked_tables = []
+        for tbl in discovered_tables:
+            score = sum(kw in tbl.lower() for kw in keywords)
+            ranked_tables.append((score, tbl))
+        ranked_tables.sort(reverse=True)
 
-                # Search columns
-                try:
-                    col_result = await search_columns_by_name(kw)
-                    if "Error" not in col_result and col_result.strip():
-                        for line in col_result.splitlines()[2:]:
-                            if '|' in line and not line.startswith('-'):
-                                parts = [p.strip() for p in line.split('|')]
-                                if len(parts) >= 3:
-                                    full_table = f"{parts[0]}.{parts[1]}.{parts[2]}"
-                                    discovered_tables.add(full_table)
-                except Exception as e:
-                    print(f"Error searching columns for '{kw}': {e}", file=sys.stderr)
+        # Pick top 2 candidates
+        top_tables = [t for _, t in ranked_tables[:2]]
 
-           
-            # Rank discovered tables: prioritize ones with multiple keyword matches
-            ranked_tables = []
-            for table in discovered_tables:
-                score = sum(kw in table.lower() for kw in keywords)
-                ranked_tables.append((score, table))
-            ranked_tables.sort(reverse=True)
+        # 4. Build schema context with full table names + columns
+        schema_context = "The following tables are available. You MUST use only these, exactly as written:\n\n"
+        for table in top_tables:
+            try:
+                details = await get_table_details(table, include_lineage=False)
+                schema_context += f"Table: {table}\n"
+                schema_context += f"{details}\n---\n"
+            except Exception as e:
+                print(f"Error getting details for {table}: {e}", file=sys.stderr)
 
-            # Take top 2 most relevant tables only
-            top_tables = [t for _, t in ranked_tables[:2]]
+        # 5. Generate SQL from NL query
+        sql_query = generate_sql_from_natural_language(
+            query=query,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            schema_context=schema_context
+        )
 
-            schema_context = "The following tables are available. You MUST use only these:\n"
-            for table in top_tables:
-                try:
-                    table_details = await get_table_details(table, include_lineage=False)
-                    schema_context += f"\n{table_details}\n---\n"
-                except Exception as e:
-                    print(f"Error getting details for table '{table}': {e}", file=sys.stderr)
+        # 6. Execute SQL
+        result = execute_databricks_sql(sql_query)
+        return f"**Generated SQL:**\n```sql\n{sql_query}\n```\n\n**Results:**\n{result}"
 
-        generated_sql = generate_sql_from_natural_language(query, catalog_name, schema_name, schema_context)
-        if generated_sql.startswith("Error:"):
-            return generated_sql
-
-        result = await execute_sql_query(generated_sql)
-        response = f"**Generated SQL:**\n```sql\n{generated_sql}\n```\n\n"
-        if schema_context:
-            response += f"**Discovered Schema Context:**\n{schema_context}\n\n"
-        response += f"**Results:**\n{result}"
-        return response
     except Exception as e:
-        return f"Error in smart natural language query: {str(e)}"
+        return f"Error in smart_natural_language_query: {str(e)}"
+
 
 # ----------------
 # Utilities

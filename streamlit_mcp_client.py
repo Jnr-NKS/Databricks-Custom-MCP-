@@ -1,12 +1,15 @@
 import streamlit as st
-import requests
-import json
 import subprocess
-import threading
 import time
-import os
-from typing import Optional, Dict, Any
 import sys
+import json
+
+# set_page_config MUST be the first Streamlit command
+st.set_page_config(
+    page_title="Databricks MCP Client",
+    page_icon="🔍",
+    layout="wide"
+)
 
 class MCPClient:
     def __init__(self):
@@ -43,7 +46,7 @@ class MCPClient:
             self.process.wait()
             self.process = None
     
-    def send_request(self, method: str, params: Optional[Dict] = None) -> Dict[str, Any]:
+    def send_request(self, method: str, params: dict = None) -> dict:
         """Send a JSON-RPC request to the server"""
         if not self.server_stdin or not self.server_stdout:
             return {"error": "Server not connected"}
@@ -73,12 +76,6 @@ class MCPClient:
             return {"error": f"Communication error: {e}"}
 
 def main():
-    st.set_page_config(
-        page_title="Databricks MCP Client",
-        page_icon="🔍",
-        layout="wide"
-    )
-    
     st.title("🔍 Databricks MCP Client")
     st.markdown("Interactive client for exploring Databricks Unity Catalog and executing SQL queries")
     

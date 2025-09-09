@@ -32,31 +32,58 @@ if GEMINI_API_KEY:
 
 mcp = FastMCP("databricks")
 
-def generate_sql_from_natural_language(query: str, catalog_name: Optional[str] = None,
-                                       schema_name: Optional[str] = None,
-                                       schema_context: Optional[str] = None) -> str:
-    """Uses Gemini AI to convert natural language to SQL."""
+def generate_sql_from_natural_language(
+    query: str,
+    catalog_name: Optional[str] = None,
+    schema_name: Optional[str] = None,
+    schema_context: Optional[str] = None
+) -> str:
+    """
+    Uses Gemini AI to convert natural language to Databricks SQL.
+    Enforces SQL-only output using <SQL>...</SQL> tags.
+    Prefers actual discovered schema context over generic guesses.
+    """
     if not GEMINI_API_KEY:
         return "Error: GEMINI_API_KEY not set. Cannot generate SQL from natural language."
-    
+
     try:
-        context = "You are a SQL expert that converts natural language questions to Databricks SQL."
+        # Build strong context for Gemini
+        context = (
+            "You are a SQL assistant that converts natural language into Databricks SQL queries.\n"
+            "Rules:\n"
+            "1. Return ONLY a single valid SQL query.\n"
+            "2. Do NOT add explanations, comments, or alternative queries.\n"
+            "3. If schema context is provided, use only those tables/columns.\n"
+            "4. Always wrap the SQL inside <SQL>...</SQL> tags.\n"
+        )
+
         if catalog_name:
-            context += f" The default catalog is {catalog_name}."
+            context += f"\nDefault catalog: {catalog_name}."
         if schema_name:
-            context += f" The default schema is {schema_name}."
-        
+            context += f"\nDefault schema: {schema_name}."
         if schema_context:
-            context += f"\n\nAvailable schema information:\n{schema_context}"
-            context += "\n\nUse the table and column names from the schema information above when generating SQL."
-        
-        model = genai.GenerativeModel('gemini-pro')
-        prompt = f"{context}\n\nConvert this natural language query to Databricks SQL:\n\n{query}"
-        
+            context += f"\n\nAvailable schema information:\n{schema_context}\n"
+
+        # Construct prompt
+        prompt = f"{context}\nNatural language query:\n{query}"
+
+        model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(prompt)
-        return response.text.strip().replace("```sql", "").replace("```", "").strip()
+
+        sql_text = response.text or ""
+
+        # Extract only the SQL inside <SQL>...</SQL>
+        import re
+        match = re.search(r"<SQL>(.*?)</SQL>", sql_text, re.S | re.I)
+        if match:
+            return match.group(1).strip()
+        else:
+            # fallback: return first SQL-like block
+            return sql_text.strip().split(";")[0] + ";"
+
     except Exception as e:
         return f"Error generating SQL: {str(e)}"
+
 
 # ----------------
 # Catalog / Schema / Table listing

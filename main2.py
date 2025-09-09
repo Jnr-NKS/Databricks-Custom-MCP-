@@ -55,6 +55,8 @@ def generate_sql_from_natural_language(
             "2. Do NOT add explanations, comments, or alternative queries.\n"
             "3. If schema context is provided, use only those tables/columns.\n"
             "4. Always wrap the SQL inside <SQL>...</SQL> tags.\n"
+            "5. Do NOT add any text before or after the <SQL> tags.\n"
+            "6. Ensure the SQL is valid Databricks SQL syntax.\n"
         )
 
         if catalog_name:
@@ -73,18 +75,25 @@ def generate_sql_from_natural_language(
         sql_text = response.text or ""
 
         # Extract only the SQL inside <SQL>...</SQL>
-        import re
         match = re.search(r"<SQL>(.*?)</SQL>", sql_text, re.S | re.I)
         if match:
-            return match.group(1).strip()
+            sql_content = match.group(1).strip()
+            # Clean up any remaining non-SQL content
+            sql_content = re.sub(r'^[^A-Za-z0-9\s\(\)\*]*', '', sql_content)  # Remove any non-SQL characters at start
+            return sql_content
         else:
-            # fallback: return first SQL-like block
-            return sql_text.strip().split(";")[0] + ";"
+            # fallback: clean the entire response and try to extract SQL
+            # Remove any markdown code blocks and non-SQL content
+            cleaned_sql = re.sub(r'^```sql|```$', '', sql_text, flags=re.IGNORECASE).strip()
+            cleaned_sql = re.sub(r'^[^A-Za-z0-9\s\(\)\*]*', '', cleaned_sql)  # Remove any non-SQL characters at start
+            # Take only the first SQL statement
+            sql_statements = cleaned_sql.split(';')
+            if sql_statements:
+                return sql_statements[0].strip() + ';'
+            return cleaned_sql
 
     except Exception as e:
         return f"Error generating SQL: {str(e)}"
-
-
 # ----------------
 # Catalog / Schema / Table listing
 # ----------------

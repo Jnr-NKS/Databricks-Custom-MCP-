@@ -59,23 +59,26 @@ def generate_sql_from_natural_language(
 ) -> str:
     """
     Uses Gemini AI to convert natural language to Databricks SQL.
-    Enforces SQL-only output using <SQL>...</SQL> tags.
-    Prefers actual discovered schema context over generic guesses.
     """
     if not GEMINI_API_KEY:
         return "Error: GEMINI_API_KEY not set. Cannot generate SQL from natural language."
 
     try:
-        # Build strong context for Gemini
+        # Build STRONGER context for Gemini with stricter rules
         context = (
             "You are a SQL assistant that converts natural language into Databricks SQL queries.\n"
-            "Rules:\n"
-            "1. Return ONLY a single valid SQL query.\n"
-            "2. Do NOT add explanations, comments, or alternative queries.\n"
-            "3. If schema context is provided, use only those tables/columns.\n"
-            "4. Always wrap the SQL inside <SQL>...</SQL> tags.\n"
-            "5. Do NOT add any text before or after the <SQL> tags.\n"
-            "6. Ensure the SQL is valid Databricks SQL syntax.\n"
+            "CRITICAL RULES - DO NOT BREAK THESE:\n"
+            "1. You MUST return ONLY a single valid SQL query, nothing else\n"
+            "2. NEVER add explanations, comments, or alternative queries\n"
+            "3. If schema context is provided, use ONLY those tables/columns\n"
+            "4. If schema context is not provided, scan entire hive metastore for the best possible schema based on column names & table names \n"
+            "5. If you cannot generate a query, return: 'SELECT 1 AS error_no_valid_query'\n"
+            "6. ALWAYS wrap the SQL inside <SQL>...</SQL> tags\n"
+            "7. NEVER add any text before or after the <SQL> tags\n"
+            "8. If tables don't match the query, still generate the best possible SQL\n"
+            "9. NEVER say 'Unable to provide a query' - always generate SQL\n"
+            "\n"
+            "FAILURE TO FOLLOW THESE RULES WILL CAUSE SYSTEM ERRORS\n"
         )
 
         if catalog_name:
@@ -83,36 +86,44 @@ def generate_sql_from_natural_language(
         if schema_name:
             context += f"\nDefault schema: {schema_name}."
         if schema_context:
-            context += f"\n\nAvailable schema information:\n{schema_context}\n"
+            context += f"\n\nAVAILABLE SCHEMA INFORMATION (USE THESE TABLES ONLY):\n{schema_context}\n"
+        else:
+            context += "\nWARNING: No specific schema context provided."
 
-        # Construct prompt
-        prompt = f"{context}\nNatural language query:\n{query}"
+        # Construct prompt with explicit instruction
+        prompt = f"{context}\n\nNatural language query to convert to SQL:\n{query}\n\nRemember: ONLY return SQL inside <SQL> tags, no explanations!"
 
         model = genai.GenerativeModel("gemini-1.5-flash")
         response = model.generate_content(prompt)
 
         sql_text = response.text or ""
 
+        # Debug: log what Gemini returned
+        print(f"Gemini raw response: {repr(sql_text)}", file=sys.stderr)
+
         # Extract only the SQL inside <SQL>...</SQL>
         match = re.search(r"<SQL>(.*?)</SQL>", sql_text, re.S | re.I)
         if match:
             sql_content = match.group(1).strip()
             # Clean up any remaining non-SQL content
-            sql_content = re.sub(r'^[^A-Za-z0-9\s\(\)\*]*', '', sql_content)  # Remove any non-SQL characters at start
+            sql_content = re.sub(r'^[^A-Za-z0-9\s\(\)\*]*', '', sql_content)
+            
+            # Validate it's actually SQL
+            valid_starters = ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'SHOW', 'DESCRIBE', 'EXPLAIN']
+            if not any(sql_content.upper().startswith(keyword) for keyword in valid_starters):
+                return "SELECT 1 AS error_invalid_sql_generated"
+                
             return sql_content
         else:
-            # fallback: clean the entire response and try to extract SQL
-            # Remove any markdown code blocks and non-SQL content
-            cleaned_sql = re.sub(r'^```sql|```$', '', sql_text, flags=re.IGNORECASE).strip()
-            cleaned_sql = re.sub(r'^[^A-Za-z0-9\s\(\)\*]*', '', cleaned_sql)  # Remove any non-SQL characters at start
-            # Take only the first SQL statement
-            sql_statements = cleaned_sql.split(';')
-            if sql_statements:
-                return sql_statements[0].strip() + ';'
-            return cleaned_sql
+            # If no SQL tags found, check if it's pure SQL
+            if any(sql_text.upper().startswith(keyword) for keyword in valid_starters):
+                return sql_text.strip()
+            
+            # If Gemini returned explanatory text, return a safe fallback
+            return "SELECT 1 AS error_no_sql_generated"
 
     except Exception as e:
-        return f"Error generating SQL: {str(e)}"
+        return f"SELECT 1 AS error_generation_failed"
 # ----------------
 # Catalog / Schema / Table listing
 # ----------------
